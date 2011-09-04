@@ -1,0 +1,210 @@
+ make.py |  134 ++++++++++++++++++++++++++++++++++++++++++++++++--------------
+ 1 files changed, 103 insertions(+), 31 deletions(-)
+
+diff --git a/make.py b/make.py
+index 045d495..949b59e 100755
+--- a/make.py
++++ b/make.py
+@@ -18,12 +18,34 @@ import tools.shared as emscripten
+ 
+ # Settings
+ 
+-build_type = sys.argv[1] if len(sys.argv) >= 2 else 'safe'
+-
++build_type = 'safe'
++target = 'main'
++
++stages = [ "generate_bindings", "build_bindings", "build_bullet", "link_bullet", "gen_assembly", "gen_javascript", "do_bundle", "closure", "wrap" ];
++
++def extract_arg(arg, index):
++  #print 'Processing arg ', index, ': "' + arg + '"'
++  global build_type, target
++  if arg in [ "safe", "fast", "ta1", "ta2" ]:
++    build_type = arg
++    #print 'Arg ', index, ': "' + arg + '" is a command'
++  elif arg in stages:
++    target = arg
++    #print 'Arg ', index, ': "' + arg + '" is a target'
++  else:
++    print "ERROR: unrecognised argument", index, ":", arg
++    sys.exit(1)
++
++if len(sys.argv) >= 2:
++  extract_arg(sys.argv[1], 1)
++if len(sys.argv) >= 3:
++  extract_arg(sys.argv[2], 2)
++
++text = 'Building ammo.js, build type: %s, target: %s' % ( build_type, target )
+ print
+-print '--------------------------------------------------'
+-print 'Building ammo.js, build type:', build_type
+-print '--------------------------------------------------'
++print '-' * len(text)
++print text
++print '-' * len(text)
+ print
+ 
+ EMSCRIPTEN_SETTINGS = {
+@@ -108,25 +130,37 @@ if EMSCRIPTEN_SETTINGS['SAFE_HEAP']:
+ # Utilities
+ 
+ stage_counter = 0
++env = {};
++
++def check_stage_name():
++  global stage_counter
++  if target == stages[stage_counter]:
++    #print "%d: %s == %s" % ( stage_counter, target, stages[stage_counter] )
++    return 1
++  else:
++    #print "%d: %s != %s" % ( stage_counter, target, stages[stage_counter] )
++    stage_counter += 1
++    return 0
++
++for item in stages:
++  if check_stage_name():
++    break
++
++if stage_counter == len(stages):
++  stage_counter = 0 # main
++
+ def stage(text):
+   global stage_counter
+   stage_counter += 1
+-  text = 'Stage %d: %s' % (stage_counter, text)
++  text = 'Stage %d(%s): %s' % (stage_counter, stages[stage_counter-1], text)
+   print
+   print '=' * len(text)
+   print text
+   print '=' * len(text)
+   print
+ 
+-# Main
+-
+-try:
+-  this_dir = os.getcwd()
+-  os.chdir('bullet')
+-  if not os.path.exists('build'):
+-    os.makedirs('build')
+-  os.chdir('build')
+-
++def generate_bindings():
++  global env
+   stage('Generate bindings')
+ 
+   print 'Preprocessing...'
+@@ -184,20 +218,29 @@ try:
+     env['CFLAGS'] = '-g'
+   env['CC'] = env['CXX'] = env['RANLIB'] = env['AR'] = os.path.join(EMSCRIPTEN_ROOT, 'tools', 'emmaken.py')
+ 
++def build_bindings():
+   stage('Build bindings')
+ 
+   print Popen([env['EMMAKEN_COMPILER'], '-I../src', '-include', 'btBulletDynamicsCommon.h', 'bindings.cpp', '-emit-llvm', '-c', '-o', 'bindings.bc']).communicate()
+ 
+   #1/0.
+ 
++def build_bullet():
+   stage('Build Bullet')
+ 
+   if not os.path.exists('config.h'):
+-    Popen(['../configure', '--disable-demos','--disable-dependency-tracking'], env=env).communicate()
++    Popen(['../configure', '--disable-demos', '--disable-dependency-tracking'], env=env).communicate()
+   Popen(['make', '-j', '2'], env=env).communicate()
+ 
+   assert(os.path.exists('bindings.bc'))
+ 
++def llvm_optimize():
++  stage('LLVM optimizations')
++
++  shutil.move('libbullet.bc', 'libbullet.bc.pre')
++  output = Popen([emscripten.LLVM_OPT, 'libbullet.bc.pre'] + LLVM_OPT_OPTS + ['-o=libbullet.bc'], stdout=PIPE, stderr=STDOUT).communicate()
++
++def link_bullet():
+   stage('Link')
+ 
+   Popen([emscripten.LLVM_LINK, os.path.join('src', '.libs', 'libBulletCollision.a'),
+@@ -209,17 +252,16 @@ try:
+   assert os.path.exists('libbullet.bc'), 'Failed to create client'
+ 
+   if LLVM_OPT_OPTS:
+-    stage('LLVM optimizations')
+-
+-    shutil.move('libbullet.bc', 'libbullet.bc.pre')
+-    output = Popen([emscripten.LLVM_OPT, 'libbullet.bc.pre'] + LLVM_OPT_OPTS + ['-o=libbullet.bc'], stdout=PIPE, stderr=STDOUT).communicate()
++    llvm_optimize()
+ 
++def gen_assembly():
+   stage('LLVM binary => LL assembly')
+ 
+   Popen([emscripten.LLVM_DIS] + emscripten.LLVM_DIS_OPTS + ['libbullet.bc', '-o=libbullet.ll']).communicate()
+ 
+   assert os.path.exists('libbullet.ll'), 'Failed to create assembly code'
+ 
++def gen_javascript():
+   stage('Emscripten: LL assembly => JavaScript')
+ 
+   settings = ['-s %s=%s' % (k, json.dumps(v)) for k, v in EMSCRIPTEN_SETTINGS.items()]
+@@ -228,21 +270,51 @@ try:
+ 
+   assert os.path.exists('libbullet.js'), 'Failed to create script code'
+ 
+-finally:
+-  os.chdir(this_dir);
+-
+-stage('Bundle')
++def do_bundle():
++  stage('Bundle')
+ 
+-bundle = open(os.path.join('builds', 'ammo.new.js'), 'w')
+-bundle.write(open(os.path.join('bullet', 'build', 'libbullet.js'), 'r').read())
+-bundle.write(open(os.path.join('bullet', 'build', 'bindings.js'), 'r').read())
+-bundle.write('''
+-this['Ammo'] = this; // With or without a closure, the proper usage is Ammo.*
++  bundle = open(os.path.join('builds', 'ammo.new.js'), 'w')
++  bundle.write(open(os.path.join('bullet', 'build', 'libbullet.js'), 'r').read())
++  bundle.write(open(os.path.join('bullet', 'build', 'bindings.js'), 'r').read())
++  bundle.write('''
++  this['Ammo'] = this; // With or without a closure, the proper usage is Ammo.*
+ ''')
+-bundle.close()
++  bundle.close()
++
++def closure():
++  stage('Closure')
++  Popen(['java', '-Xmx1024m', '-jar', CLOSURE_COMPILER, '--compilation_level', 'ADVANCED_OPTIMIZATIONS', '--variable_map_output_file', 'builds/ammo.vars', '--js', 'builds/ammo.new.js', '--js_output_file', 'builds/ammo.cc.js']).communicate()
+ 
+ # Recommended: Also do closure compiler: (note: increase the memory usage as needed)
+-# java -Xmx1024m -jar /home/alon/Dev/closure-compiler-read-only/build/compiler.jar --compilation_level ADVANCED_OPTIMIZATIONS --variable_map_output_file builds/ammo.vars --js builds/ammo.new.js --js_output_file builds/ammo.js
++# java -Xmx1024m -jar /home/alon/Dev/closure-compiler-read-only/build/compiler.jar --compilation_level ADVANCED_OPTIMIZATIONS --variable_map_output_file builds/ammo.vars --js builds/ammo.new.js --js_output_file builds/ammo.cc.js
+ 
+ # and wrap.py after it, optionally (decreases performance, but adds encapsulation)
+ 
++def wrap():
++  stage('Wrap')
++  Popen(['python', 'wrap.py']).communicate()
++
++# Main
++
++this_dir = os.getcwd()
++os.chdir('bullet')
++if not os.path.exists('build'):
++  os.makedirs('build')
++os.chdir('build')
++
++if target == "main":
++  generate_bindings()
++  build_bindings()
++  build_bullet()
++  link_bullet()
++  gen_assembly()
++  gen_javascript()
++
++  os.chdir(this_dir);
++  do_bundle()
++  #closure()
++  #wrap()
++else:
++  if target in [ 'do_bundle', 'closure', 'wrap' ]:
++    os.chdir(this_dir);
++  eval(target + "()")
